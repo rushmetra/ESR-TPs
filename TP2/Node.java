@@ -1,39 +1,57 @@
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.net.*;
 import java.util.*;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import javax.swing.Timer;
 
 public class Node {
 
-    private InetAddress ip; // ip de cada nodo
+    protected InetAddress ip; // ip de cada nodo
 
     // Tabelas de Encaminhamento e custos
-    private Map<InetAddress,String> tabela_encaminhamento = new HashMap<>(); // (ip,estado)
-    private Map<InetAddress,Integer> tabela_custos = new HashMap<>(); // (ip,custo)
-    private InetAddress nodo_anterior = null;
+    protected Map<InetAddress,String> tabela_encaminhamento = new HashMap<>(); // (ip,estado)
+    protected Map<InetAddress,Integer> tabela_custos = new HashMap<>(); // (ip,custo)
+    protected InetAddress nodo_anterior = null;
 
     // Sockects
-    private DatagramSocket socketPing;
-    private DatagramSocket socketPingRouter;
-    private DatagramSocket socketOverlay;
-    private DatagramSocket socketFlooding;
-    private DatagramSocket socketAtivacao;
+    protected DatagramSocket socketPing;
+    protected DatagramSocket socketPingRouter;
+    protected DatagramSocket socketOverlay;
+    protected DatagramSocket socketFlooding;
+    protected DatagramSocket socketAtivacao;
 
 
     //Ping
-    private Map<InetAddress,Integer> tabela_ping = new HashMap<>();
-    private Map<InetAddress,Integer> tabela_ping_router = new HashMap<>();
+    protected Map<InetAddress,Integer> tabela_ping = new HashMap<>();
+    // Lock
+    protected ReentrantLock lock_ping = new ReentrantLock();
+    protected Condition condition_ping = lock_ping.newCondition();
+    protected Map<InetAddress,Integer> tabela_ping_router = new HashMap<>();
+    // Lock
+    protected ReentrantLock lock_ping_router = new ReentrantLock();
+    protected Condition condition_ping_router = lock_ping_router.newCondition();
+
 
 
     // STream
-    DatagramPacket recebido;
-    DatagramSocket RTPsocket; // enviar e receber pacotes udp
-    static int porta_rtp = 20000;
+    DatagramPacket rcvdp; //UDP packet received from the server (to receive)
+    DatagramSocket RTPsocket; // socket para enviar e receber pacotes udp
+    static int RTP_RCV_PORT = 25000; //port where the client will receive the RTP packets
+    Timer cTimer;
+    byte[] cBuffer;
 
+    JLabel iconLabel = new JLabel();
+    ImageIcon icon;
 
-    Timer temporizador;
-    byte[] cont_buffer;
-
-    //public Node() {}
+    public Node() {
+        // tem que ter construtor para conseguir fazer construtor cliente
+    }
 
     public Node(InetAddress ipServer) throws IOException,ClassNotFoundException {
         InetAddress ip_address = null;
@@ -54,7 +72,7 @@ public class Node {
 
         this.ip = ip_address;
 
-        this.socketFlooding = new DatagramSocket(1000,this.ip);
+        this.socketFlooding = new DatagramSocket(1500,this.ip);
         this.socketAtivacao = new DatagramSocket(2000,this.ip);
         this.socketOverlay = new DatagramSocket(3000,this.ip);
         this.socketPing = new DatagramSocket(4000,this.ip);
@@ -199,7 +217,7 @@ public class Node {
                         if (!inet.equals(nodo_anterior)){
                             Packet mensagem = new Packet(2,custo+1,null);
                             byte[] dados_resposta = mensagem.serialize();
-                            DatagramPacket pacote_resposta = new DatagramPacket(dados_resposta,dados_resposta.length,inet,1000);
+                            DatagramPacket pacote_resposta = new DatagramPacket(dados_resposta,dados_resposta.length,inet,1500);
                             socketFlooding.send(pacote_resposta);
                         }
                     }
@@ -211,7 +229,7 @@ public class Node {
                              if (!ip.equals(nodo_anterior)){
                                  Packet mensagem1 = new Packet(2,custo+1,null);
                                  byte[] dados_resposta1 = mensagem1.serialize();
-                                 DatagramPacket pacote_resposta = new DatagramPacket(dados_resposta1,dados_resposta1.length,ip,1000);
+                                 DatagramPacket pacote_resposta = new DatagramPacket(dados_resposta1,dados_resposta1.length,ip,1500);
                                  socketFlooding.send(pacote_resposta);
                              }
                          }
@@ -279,13 +297,177 @@ public class Node {
     }
 
     public void ping() throws IOException,InterruptedException{
-        byte[] data = new byte[1024];
+        byte[] data_recebido = new byte[1024];
+        new Ping(3,tabela_ping,lock_ping,condition_ping);
+
+        DatagramPacket packet_recebido = new DatagramPacket(data_recebido,data_recebido.length); // recebe packet a dizer qual o custo
+
+        // thread que escuta clientes que morreram
+        new Thread(() -> {
+            try {
+                lock_ping.lock();
+                while (true){
+                    while (!tabela_ping.containsValue(-1)){
+                        condition_ping.await();
+                    }
+
+                    InetAddress ip_morto = null;
+                    for (InetAddress ip : tabela_ping.keySet()){
+                        if (tabela_ping.get(ip) == -1 ) ip_morto = ip;
+                    }
+                    tabela_ping.remove(ip_morto);
+
+                    tabela_encaminhamento.put(ip_morto,"DESATIVADO");
+                    System.out.println("Cliente " + ip_morto + " foi desativado");
+                }
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            } finally {
+                lock_ping.unlock();
+            }
+        }).start();
+
+        // escutar pings
+        while (true) {
+            try {
+                socketPing.receive(packet_recebido);
+                socketPing.setSoTimeout(5000);
+
+                InetAddress ip_recebido = packet_recebido.getAddress();
+                System.out.println("Recebi ping do " + ip_recebido);
+
+                try {
+                    lock_ping.lock();
+
+                    // se o ip recebido ja ta na tabela vou aumentar 1 o nº de pings
+                    if (tabela_ping.containsKey(ip_recebido)) {
+                        int nping = tabela_ping.get(ip_recebido);
+                        tabela_ping.put(ip_recebido,nping + 1);
+                    }else { //se o ip nao ta na tabela tenho de meter o ip na tabela com o numero max de pings que esta na tabela pq se metessemos
+                        // 1 e o max tivesse por exemplo 5  este ia ja tar morto pq nos definimos que todos os nodos que tenham menos de max - 3 estavam mortos
+
+                        int max = 1;
+                        for (InetAddress i : tabela_ping.keySet()){
+                            if (tabela_ping.get(i) > max)
+                                max = tabela_ping.get(i);
+                        }
+                        tabela_ping.put(ip_recebido,max);
+                    }
+                } finally {
+                    lock_ping.unlock();
+                }
+
+            } catch (SocketTimeoutException e){
+                // se levar timeout
+
+                //meter todas as suas routas desativadas
+                for (InetAddress ip : tabela_encaminhamento.keySet()){
+                    tabela_encaminhamento.put(ip,"DESATIVADO");
+                }
 
 
+                socketPing.setSoTimeout(0);
+
+                // envia o no anterior que desativou a sua conexao
+                Packet p = new Packet(5,0,null);
+                byte[] data = p.serialize();
+                DatagramPacket dpacket = new DatagramPacket(data, data.length,nodo_anterior,2000);
+                socketAtivacao.send(dpacket);
+            }
+        }
     }
+
+
     public void pingRouter() throws IOException,InterruptedException{
+        byte[] data_recebido = new byte[1024];
+        new Ping(3,tabela_ping_router,lock_ping_router,condition_ping_router);
+
+        DatagramPacket packet_recebido = new DatagramPacket(data_recebido,data_recebido.length); // recebe packet a dizer qual o custo
+
+        // thread que escuta routers que morreram
+        new Thread(() -> {
+            try {
+                lock_ping_router.lock();
+
+                while (true){
+                    while (!tabela_ping_router.containsValue(-1)){
+                        condition_ping_router.await();
+                    }
+
+                    InetAddress ip_morto = null;
+                    for (InetAddress ip : tabela_ping_router.keySet()){
+                        if (tabela_ping_router.get(ip) == -1 ) ip_morto = ip;
+                    }
+                    tabela_ping_router.remove(ip_morto);
+
+                    tabela_encaminhamento.put(ip_morto,"DESATIVADO");
+                    System.out.println("Router " + ip_morto + " foi desativado");
+
+                    tabela_custos.remove(ip_morto);
+
+                    if (nodo_anterior.equals(ip_morto)){
+                        InetAddress ip_min = null;
+                        for (InetAddress i : tabela_custos.keySet()){
+                            if (ip_min == null || tabela_custos.get(i) < tabela_custos.get(ip_min) )
+                                ip_min = i;
+                        }
+
+                        nodo_anterior = ip_min;
+
+                        if (tabela_encaminhamento.containsValue("ATIVADO")){
+                            // envia mensagem de ativacao caso possua alguma rota ativa
+                            Packet p = new Packet(3,0,null);
+                            byte[] data = p.serialize();
+                            DatagramPacket packet = new DatagramPacket(data, data.length,nodo_anterior,2000);
+                            socketAtivacao.send(packet);
+                        }
+                    }
+                    System.out.println("Router " + ip_morto + "foi removido");
+                }
+            } catch (InterruptedException | IOException e) {
+                e.printStackTrace();
+            } finally {
+                lock_ping_router.unlock();
+            }
+        }).start();
+
+        // escutar pings
+        while (true) {
+            try {
+                socketPingRouter.receive(packet_recebido);
+                socketPingRouter.setSoTimeout(5000);
+
+                InetAddress ip_recebido = packet_recebido.getAddress();
+                //System.out.println("Recebi ping do " + ip_recebido);
+
+                try {
+                    lock_ping_router.lock();
+
+                    // se o ip recebido ja ta na tabela vou aumentar 1 o nº de pings
+                    if (tabela_ping_router.containsKey(ip_recebido)) {
+                        int nping = tabela_ping_router.get(ip_recebido);
+                        tabela_ping_router.put(ip_recebido,nping + 1);
+                    }else { //se o ip nao ta na tabela tenho de meter o ip na tabela com o numero max de pings que esta na tabela pq se metessemos
+                        // 1 e o max tivesse por exemplo 5  este ia ja tar morto pq nos definimos que todos os nodos que tenham menos de max - 3 estavam mortos
+
+                        int max = 1;
+                        for (InetAddress i : tabela_ping_router.keySet()){
+                            if (tabela_ping_router.get(i) > max)
+                                max = tabela_ping_router.get(i);
+                        }
+                        tabela_ping_router.put(ip_recebido,max);
+                    }
+                } finally {
+                    lock_ping_router.unlock();
+                }
+
+            } catch (SocketTimeoutException e){
+                System.out.println("Todos os nodos ligados ao router " + ip + "foram desativados");
+            }
+        }
 
     }
+
     public void enviarPingRouter() throws IOException,InterruptedException{
         while (true) {
             Thread.sleep(500); // enquanto o nodo ta vivo vai avisando os adjacentes de 500ms em 500ms
@@ -301,12 +483,74 @@ public class Node {
     }
 
     public void stream () {
+        //init para a parte do cliente
+        //--------------------------
 
+        cTimer = new Timer(20, new clientTimerListener());
+        cTimer.setInitialDelay(0);
+        cTimer.setCoalesce(true);
+        cBuffer = new byte[15000]; //allocate enough memory for the buffer used to receive data from the server
+
+        cTimer.start();
+        try {
+            // socket e video
+            RTPsocket = new DatagramSocket(RTP_RCV_PORT); //init RTP socket (o mesmo para o cliente e servidor)
+            RTPsocket.setSoTimeout(5000); // setimeout to 5s
+
+        } catch (SocketException e) {
+            System.out.println("Cliente: erro no socket: " + e.getMessage());
+        }
+    }
+    
+    class clientTimerListener implements ActionListener {
+        public void actionPerformed(ActionEvent e) {
+
+            //Construct a DatagramPacket to receive data from the UDP socket
+            rcvdp = new DatagramPacket(cBuffer, cBuffer.length);
+
+            try{
+                //receive the DP from the socket:
+                RTPsocket.receive(rcvdp);
+
+                //create an RTPpacket object from the DP
+                RTPpacket rtp_packet = new RTPpacket(rcvdp.getData(), rcvdp.getLength());
+
+                //print important header fields of the RTP packet received:
+                System.out.println("Got RTP packet with SeqNum # "+rtp_packet.getsequencenumber()+" TimeStamp "+rtp_packet.gettimestamp()+" ms, of type "+rtp_packet.getpayloadtype());
+
+                //print header bitstream:
+                rtp_packet.printheader();
+
+                //get the payload bitstream from the RTPpacket object
+                int payload_length = rtp_packet.getpayload_length();
+                byte [] payload = new byte[payload_length];
+                rtp_packet.getpayload(payload);
+
+                //get an Image object from the payload bitstream
+                Toolkit toolkit = Toolkit.getDefaultToolkit();
+                Image image = toolkit.createImage(payload, 0, payload_length);
+
+                //display the image as an ImageIcon object
+                icon = new ImageIcon(image);
+                iconLabel.setIcon(icon);
+            }
+            catch (InterruptedIOException iioe){
+                System.out.println("Nothing to read");
+            }
+            catch (IOException ioe) {
+                System.out.println("Exception caught: "+ioe);
+            }
+        }
     }
 
 
 
 }
+
+
+
+
+
 
 
 

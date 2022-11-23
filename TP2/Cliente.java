@@ -13,7 +13,7 @@ import java.awt.event.*;
 import javax.swing.*;
 import javax.swing.Timer;
 
-public class Cliente {
+public class Cliente extends Node{
 
   //GUI
   //----
@@ -40,67 +40,143 @@ public class Cliente {
   //--------------------------
   //Constructor
   //--------------------------
-  public Cliente() {
+  public Cliente(InetAddress ipServidor) throws SocketException {
+    InetAddress ip = null;
 
-    //build GUI
-    //--------------------------
- 
-    //Frame
-    f.addWindowListener(new WindowAdapter() {
-       public void windowClosing(WindowEvent e) {
-	 System.exit(0);
-       }
-    });
+      Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+      for(NetworkInterface i : Collections.list(interfaces)) {
+          if (!i.isLoopback() || !i.isUp()) {
+              Enumeration<InetAddress> inetAddresses = i.getInetAddresses();
 
-    //Buttons
-    buttonPanel.setLayout(new GridLayout(1,0));
-    buttonPanel.add(setupButton);
-    buttonPanel.add(playButton);
-    buttonPanel.add(pauseButton);
-    buttonPanel.add(tearButton);
+              for(InetAddress iA : Collections.list(inetAddresses) ) {
+                  if (iA instanceof Inet4Address)
+                      ip = iA;
+              }
+          }
+      }
 
-    // handlers... (so dois)
-    playButton.addActionListener(new playButtonListener());
-    tearButton.addActionListener(new tearButtonListener());
+      this.ip = ip;
 
-    //Image display label
-    iconLabel.setIcon(null);
-    
-    //frame layout
-    mainPanel.setLayout(null);
-    mainPanel.add(iconLabel);
-    mainPanel.add(buttonPanel);
-    iconLabel.setBounds(0,0,380,280);
-    buttonPanel.setBounds(0,280,380,50);
+      this.socketFlooding = new DatagramSocket(1500, this.ip);
+      this.socketAtivacao = new DatagramSocket(2000, this.ip);
+      this.socketOverlay = new DatagramSocket(3000, this.ip);
 
-    f.getContentPane().add(mainPanel, BorderLayout.CENTER);
-    f.setSize(new Dimension(390,370));
-    f.setVisible(true);
+      new Thread(() -> { // thread para criar a rede overlay
+          try {
+              createOverlay(ipServidor);
+          } catch (IOException | InterruptedException e) {
+              e.printStackTrace();
+          }
+      }).start();
 
-    //init para a parte do cliente
-    //--------------------------
-    cTimer = new Timer(20, new clientTimerListener());
-    cTimer.setInitialDelay(0);
-    cTimer.setCoalesce(true);
-    cBuf = new byte[15000]; //allocate enough memory for the buffer used to receive data from the server
+      new Thread(() -> { // thread escuta floods
+          try {
+              flood();
+          } catch (IOException | InterruptedException e) {
+              e.printStackTrace();
+          }
+      }).start();
 
-    try {
-    // socket e video
-	RTPsocket = new DatagramSocket(RTP_RCV_PORT); //init RTP socket (o mesmo para o cliente e servidor)
-    RTPsocket.setSoTimeout(5000); // setimeout to 5s
-    } catch (SocketException e) {
-        System.out.println("Cliente: erro no socket: " + e.getMessage());
+      new Thread(() -> { // thread escuta ativaçoes
+          try {
+              pingCliente();
+          } catch (IOException | InterruptedException e) {
+              e.printStackTrace();
+          }
+      }).start();
+
+      new Thread(() -> {
+          try {
+              ativa();
+          } catch (Exception e) {
+              e.printStackTrace();
+          }
+      }).start();
+
+      new Thread(this::stream).start();
+  }
+
+
+  public void pingCliente() throws IOException, InterruptedException {
+      while(true) {
+          Thread.sleep(500);
+          if(nodo_anterior != null) { // ver eficiencia da solução
+              Packet p = new Packet(4, 0,null);
+              byte[] dataresposta = p.serialize();
+              DatagramPacket pacote_resposta = new DatagramPacket(dataresposta, dataresposta.length, nodo_anterior, 4000);
+              socketAtivacao.send(pacote_resposta);
+          }
+      }
+  }
+
+    public void ativa() throws IOException, InterruptedException {
+
+        while(true) {
+            Thread.sleep(500);
+            if(nodo_anterior != null) {
+                Packet p = new Packet(3, 0,null);
+                byte[] dataresposta = p.serialize();
+
+                DatagramPacket pktResponse = new DatagramPacket(dataresposta, dataresposta.length, nodo_anterior, 2000);
+                socketAtivacao.send(pktResponse);
+            }
+        }
     }
-  }
 
-  //------------------------------------
-  //main
-  //------------------------------------
-  public static void main(String argv[]) throws Exception
-  {
-        Cliente t = new Cliente();
-  }
 
+
+
+    public void stream () {
+      //build GUI
+      //--------------------------
+
+      //Frame
+      f.addWindowListener(new WindowAdapter() {
+          public void windowClosing(WindowEvent e) {
+              System.exit(0);
+          }
+      });
+
+      //Buttons
+      buttonPanel.setLayout(new GridLayout(1,0));
+      buttonPanel.add(setupButton);
+      buttonPanel.add(playButton);
+      buttonPanel.add(pauseButton);
+      buttonPanel.add(tearButton);
+
+      // handlers... (so dois)
+      playButton.addActionListener(new playButtonListener());
+      tearButton.addActionListener(new tearButtonListener());
+
+      //Image display label
+      iconLabel.setIcon(null);
+
+      //frame layout
+      mainPanel.setLayout(null);
+      mainPanel.add(iconLabel);
+      mainPanel.add(buttonPanel);
+      iconLabel.setBounds(0,0,380,280);
+      buttonPanel.setBounds(0,280,380,50);
+
+      f.getContentPane().add(mainPanel, BorderLayout.CENTER);
+      f.setSize(new Dimension(390,370));
+      f.setVisible(true);
+
+      //init para a parte do cliente
+      //--------------------------
+      cTimer = new Timer(20, new clientTimerListener());
+      cTimer.setInitialDelay(0);
+      cTimer.setCoalesce(true);
+      cBuf = new byte[15000]; //allocate enough memory for the buffer used to receive data from the server
+
+      try {
+          // socket e video
+          RTPsocket = new DatagramSocket(RTP_RCV_PORT); //init RTP socket (o mesmo para o cliente e servidor)
+          RTPsocket.setSoTimeout(5000); // setimeout to 5s
+      } catch (SocketException e) {
+          System.out.println("Cliente: erro no socket: " + e.getMessage());
+      }
+  }
 
   //------------------------------------
   //Handler for buttons

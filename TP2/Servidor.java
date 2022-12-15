@@ -1,439 +1,427 @@
-/* ------------------
-   Servidor
-   usage: java Servidor [Video file]
-   adaptado dos originais pela equipa docente de ESR (nenhumas garantias)
-   colocar primeiro o cliente a correr, porque este dispara logo
-   ---------------------- */
-
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import java.io.*;
 import java.net.*;
-import java.awt.*;
 import java.util.*;
-import java.awt.event.*;
-import java.util.List;
-import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.stream.Collectors;
-import javax.swing.*;
+
+import Protocol.Interface;
+import Protocol.Pacote;
+
 import javax.swing.Timer;
 
+public class Servidor implements ActionListener {
+    private String idNodo; // Nome do nodo
 
-public class Servidor extends JFrame implements ActionListener {
-
-    private Map<InetAddress, List<InetAddress>> bootstrapper; // estrutura que guarda informaçao do ficheiro bootstrapper
-    private List<InetAddress> nodosCruciais;
-
-    private List<InetAddress> nodosRede = new ArrayList<>(); // nodos q fazem parte da rede
-    private ReentrantLock lockNodosRede = new ReentrantLock();
-    private Condition conditionNodosRede = lockNodosRede.newCondition();
+    private ReentrantLock sendLock; // lock para socket de envio de pacotes
+    private DatagramSocket sendSocket; // socket para enviar pacotes
+    private DatagramSocket rcvSocket; // socket para receber pacotes
+    public Map<String,Interface> vizinhos; // Map de vizinhos de um nó
 
 
-    private InetAddress ip; // identificador de cada nodo
-    private Map<InetAddress,String> tabela_encaminhamento = new HashMap<>(); // tabela de encaminhamento de cada nodo (Id nodo => Estado)
-    private Map<InetAddress,Integer> tabela_custos = new HashMap<>();
-    private InetAddress nodo_anterior = null; // nodo adjacente anterior
-    private DatagramSocket socketFlooding;
-    private DatagramSocket socketAtivacao;
-    private DatagramSocket socketOverlay;
+    private Map<String, List<Interface>> overlay;
+    private Set<String> clientesATransmitir;
+    private Set<String> clientesLigados;
+    private VideoStream stream;
+    private Timer sTimer;
+    static int FRAME_PERIOD = 20;
 
-    private ReentrantLock lock_tabela_encaminhamento = new ReentrantLock(); //Lock para proteger o acesso à tabela de routing
+    boolean servPrinc;
 
+    // Video
+    static String nome_video;
 
+    public Servidor(String[] args,boolean servPrinc) {
 
+        Runtime.getRuntime().addShutdownHook(new Thread() {
+            public void run() {
+                System.out.println("Encerrando conexao...");
+                encerra_conexao();
+            }
+        });
 
-    //GUI:
-  //----------------
-  JLabel label;
-
-  //RTP variables:
-  //----------------
-  DatagramPacket senddp; //UDP packet containing the video frames (to send)A
-  DatagramSocket RTPsocket; //socket to be used to send and receive UDP packet
-  int RTP_dest_port = 25000; //destination port for RTP packets 
-  InetAddress ClientIPAddr; //Client IP address
-  
-  static String VideoFileName; //video file to request to the server
-
-  private Thread stream;
-  private InetAddress ip_stream;
-  private boolean prunning = false;
-
-  //Video constants:
-  //------------------
-  int imagenb = 0; //image nb of the image currently transmitted
-  VideoStream video; //VideoStream object used to access video frames
-  static int MJPEG_TYPE = 26; //RTP payload type for MJPEG video
-  static int FRAME_PERIOD = 100; //Frame period of the video to stream, in ms
-  static int VIDEO_LENGTH = 500; //length of the video in frames
-
-  Timer sTimer; //timer used to send the images at the video frame rate
-  byte[] sBuf; //buffer used to store the images to send to the client 
-
-  //--------------------------
-  //Constructor
-  //--------------------------
-    public Servidor() throws IOException {
-
-      parseBootstrapper();
-      InetAddress ip = null;
-
-      Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
-      for(NetworkInterface i : Collections.list(interfaces)) {
-          if (!i.isLoopback() || !i.isUp()) {
-              Enumeration<InetAddress> inetAddresses = i.getInetAddresses();
-
-              for(InetAddress iA : Collections.list(inetAddresses) ) {
-                  if (iA instanceof Inet4Address)
-                      ip = iA;
-              }
-          }
-      }
-
-      this.ip = ip;
-
-      this.socketFlooding = new DatagramSocket(1500, this.ip);
-      this.socketAtivacao = new DatagramSocket(2000, this.ip);
-      this.socketOverlay = new DatagramSocket(3000, this.ip);
-
-      new Thread(() -> { // thread para criar a rede overlay
-          try {
-              comecaOverlay();
-          } catch (IOException e) {
-              e.printStackTrace();
-          }
-      }).start();
-
-      new Thread(() -> { // thread escuta floods
-          try {
-              comecaFlood();
-          } catch (IOException | InterruptedException e) {
-              e.printStackTrace();
-          }
-      }).start();
-
-      new Thread(() -> { // thread escuta ativaçoes
-          try {
-              escuta_ativacao();
-          } catch (IOException | InterruptedException e) {
-              e.printStackTrace();
-          }
-      }).start();
-
-      stream = new Thread(() -> {
-          try {
-              stream(this.ip);
-          } catch (Exception e) {
-              e.printStackTrace();
-          }
-      });
-  }
-
-    public Servidor(InetAddress ip) throws Exception {
-
-        super("Servidor");
-
-        // init para a parte do servidor
-        sTimer = new Timer(FRAME_PERIOD, this); //init Timer para servidor
-        sTimer.setInitialDelay(0);
-        sTimer.setCoalesce(true);
-        sBuf = new byte[15000]; //allocate memory for the sending buffer
 
         try {
-            RTPsocket = new DatagramSocket(); //init RTP socket
+            // coloca o nome do nodo que recebe como argumento
+            idNodo = args[0];
 
-            ClientIPAddr = ip;
+            // coloca toda a informação da overlay lida do ficheiro neste hashmap
+            this.overlay = new HashMap<>();
+            parseFicheiro(args[1]);
 
-            System.out.println("Servidor: socket " + ClientIPAddr);
-            video = new VideoStream(VideoFileName); //init the VideoStream object:
-            System.out.println("Servidor: vai enviar video da file " + VideoFileName);
 
-        } catch (SocketException e) {
-            System.out.println("Servidor: erro no socket: " + e.getMessage());
-        } catch (InterruptedException e) {
-            System.out.println("Erro await");
+            this.sendLock = new ReentrantLock();
+            this.sendSocket = new DatagramSocket();
+            this.rcvSocket = new DatagramSocket(9090);
+
+            this.vizinhos = new HashMap<>();
+            for (Interface v : overlay.get(this.idNodo)) {
+                this.vizinhos.put(v.idNodo, v);
+            }
+
+
+            this.stream = new VideoStream(nome_video);
+            clientesATransmitir = new HashSet<>();
+            clientesLigados = new HashSet<>();
+            sTimer = new Timer(FRAME_PERIOD, this); // init Timer para servidor
+            sTimer.setInitialDelay(0);
+            sTimer.setCoalesce(true);
+
+            servPrinc = servPrinc;
+
+
+            start();
+        }
+        catch (IOException e) {
+            System.out.println(e.getMessage());
+        } catch (Exception e1) {
+            System.out.println(e1.getMessage());
+        }
+    }
+
+    //------------------------------------
+    //main
+    //------------------------------------
+    public static void main(String[] args) {
+        boolean servPrinc;
+        if (args[2].equals("P")) servPrinc = true;
+        else servPrinc = false;
+        //se for indicado o nome do video para ser transmitido
+        if (args.length >= 4) {
+            nome_video = args[3];
+            System.out.println("Servidor: VideoFileName indicado como parametro: " + nome_video);
+        } else {
+            nome_video = "movie.Mjpeg";
+            System.out.println("Servidor: parametro não foi indicado. VideoFileName = " + nome_video);
         }
 
-        //Handler to close the main window
-        addWindowListener(new WindowAdapter() {
-            public void windowClosing(WindowEvent e) {
-                //stop the timer and exit
-                sTimer.stop();
-                System.exit(0);
-            }});
+        File f = new File(nome_video);
+        if (f.exists()) {
+            //Create a Main object
+            Servidor s = new Servidor(args,servPrinc);
+        } else
+            System.out.println("Ficheiro de video não existe: " + nome_video);
+    }
 
-        //GUI:
-        label = new JLabel("Send frame #        ", JLabel.CENTER);
-        getContentPane().add(label, BorderLayout.CENTER);
 
+
+    public void start() throws Exception {
         sTimer.start();
-    }
-    public void comecaOverlay() throws IOException {
+        // coloca uma thread à escuta de receber mensagens
 
-      boolean signal = false;
+        (new Thread() {
+            @Override
+            public void run() {
+                DatagramPacket packet = new DatagramPacket(new byte[65535], 65535);
 
-      List<InetAddress> vizinhos = bootstrapper.get(this.ip);
+                while (true) {
+                    try {
+                        rcvSocket.receive(packet);
+                        byte[] packetData = packet.getData();
+                        Pacote p = new Pacote(packet.getAddress(),packetData);
+                        System.out.println("Mensagem recebida do tipo " + p.tipoMensagem + " do nodo " + p.origem);
 
-      for (InetAddress i : vizinhos){
-          tabela_encaminhamento.put(i,"DESATIVADO");
-      }
-
-      try{
-          lockNodosRede.lock();
-          nodosRede.add(this.ip);
-      } finally {
-          lockNodosRede.unlock();
-      }
-
-        while (true) { //server está à escuta de nodos atétodo o bootstrapper ser lido
-
-            System.out.println("Leitura de Nodos na rede de Overlay");
-
-            byte[] data_recebido = new byte[1024];
-            DatagramPacket pacote_recebido = new DatagramPacket(data_recebido, data_recebido.length); //fica bloqueado no receive até receber alguma mensagem
-            socketOverlay.receive(pacote_recebido);
-
-            parseBootstrapper();
-
-            data_recebido = pacote_recebido.getData(); //Transformar o pacote em bytes
-
-            Packet p = new Packet(data_recebido);
-            InetAddress ip_nodo = pacote_recebido.getAddress();
-
-            if (p.getTipo() == 1) { // tipo overlay
-
-                System.out.println("Leu Nodo " + ip_nodo);
-
-                try {
-                    lockNodosRede.lock();
-                    nodosRede.add(ip_nodo);
-                } finally {
-                    lockNodosRede.unlock();
-                }
-
-                try {
-                    lockNodosRede.lock();
-                    // quando todos os nodos cruciais estao ativos
-                    if (nodosRede.containsAll(nodosCruciais) && !signal) { // signal para dizer que apenas faz o signal uma vez.
-                        conditionNodosRede.signalAll(); // Acorda a thread adormecida quando todos os nodos importantes estiverem ativos
-                        System.out.println("A Iniciar Flooding");
-                        signal = true;
+                        trataPacotesRecebidos(p.tipoMensagem,p);
                     }
-                } finally {
-                    lockNodosRede.unlock();
+                    catch (Exception ex) {
+                        rcvSocket.close();
+                        ex.printStackTrace();
+                    }
                 }
-
-                List<InetAddress> listaVizinhos = bootstrapper.get(ip_nodo);
-
-                Packet send = new Packet(7,0, listaVizinhos);
-
-                byte[] dataresposta= send.serialize(); // serializa VIZINHOS
-
-                DatagramPacket pacote_resposta = new DatagramPacket(dataresposta, dataresposta.length, ip_nodo, 4321);
-                socketOverlay.send(pacote_resposta);
-            } else{
-                tabela_encaminhamento.put(ip_nodo, "DESATIVADO");
             }
-        }
+        }).start();
+
+        (new Thread() {
+            @Override
+            public void run() {
+                while(true) {
+                    try {
+                        Thread.sleep(5000);
+                            if(!clientesLigados.isEmpty()) {
+                                for (String c : clientesLigados) {
+                                    long startTime = System.currentTimeMillis();
+                                    Pacote p = new Pacote(6, idNodo, c, startTime);
+
+                                    enviaTodosVizinhos(p);
+                                    System.out.println("Enviei ping periodico para nodo " + p.destino );
+                                }
+                            }
+
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            }
+        }).start();
     }
 
-    public void comecaFlood() throws InterruptedException, IOException {
-      try {
-          lockNodosRede.lock();
 
-          while (!nodosRede.containsAll(nodosCruciais))
-              conditionNodosRede.await();
 
-      } finally {
-          lockNodosRede.unlock();
-      }
-      // ja todos os nodos cruciais estao ativos
+    // Resposta a cada pacote recebido
+    public void trataPacotesRecebidos(int messageType, Pacote p) throws Exception {
+        switch (messageType) {
+            case 0: // Inicio de conexao
+                new Thread(() -> {
+                    try {
+                        enviaVizinhos(p);
+                        // atualiza informação da overlay e mete o nodo de quem recebeu a mensagem a ativo(p.origem)
+                        ativa_interfaces_vizinhos(p.origem);
 
-      while(true){
-          Thread.sleep(50);
-          System.out.println("Comecou Flood");
-
-          List<InetAddress> vizinhos = new ArrayList<>();
-          vizinhos = bootstrapper.get(this.ip);
-
-          for (InetAddress i : vizinhos){
-              Packet p = new Packet(2,1,null);
-
-              byte[] data_resposta = p.serialize();
-              DatagramPacket pacote_resposta = new DatagramPacket(data_resposta, data_resposta.length,i,1500);
-              socketFlooding.send(pacote_resposta);
-          }
-
-          // FIXME testar tirar
-          Thread.sleep(20000);
-      }
-    }
-
-    public void escuta_ativacao() throws IOException,InterruptedException {
-        byte[] data_custo = new byte[1024];
-
-        DatagramPacket pacote_rcv_custo = new DatagramPacket(data_custo, data_custo.length);
-
-        while (true) {
-            System.out.println("comecar a ativacao servidor \n");
-
-            socketAtivacao.receive(pacote_rcv_custo);
-            byte[] data = pacote_rcv_custo.getData();
-            Packet p = new Packet(data);
-
-            if (p.getTipo() == 3) { // tipo ativacao
-                InetAddress address = pacote_rcv_custo.getAddress();
-
-                try {
-                    lock_tabela_encaminhamento.lock();
-
-                    if (tabela_encaminhamento.get(address).equals("DESATIVADO")) {
-                        tabela_encaminhamento.put(address, "ATIVADO");
-
-                        if(!prunning) {
-                            prunning = true;
-                            System.out.println("STREAM INICIADA!");
-                            this.ip_stream = address;
-                            stream.start();
-
+                        if (p.origem.charAt(0) == 'C') {
+                            clientesLigados.add(p.origem);
                         }
+
+                    } catch (IOException e) {
+                        System.out.println(e.getMessage());
                     }
-                } finally {
-                    lock_tabela_encaminhamento.unlock();
-                }
-                System.out.println("Nodo " + address + "foi ativado");
-            } else if (p.getTipo() == 5) { // Mete o nodo que recebeu desativado
 
-                InetAddress adress = pacote_rcv_custo.getAddress();
-                tabela_encaminhamento.put(adress, "DESATIVADO");
-                System.out.println("O nodo com o ip  " + adress + " foi desativado");
+                }).start();
+                break;
 
-            } else {
-                System.out.println("Recebeu uma mensagem do tipo errado que nao foi tipo 3 (Ativacao) e 5 (ping cliente Pruning)");
+            case 1: // Mensagem de routing
+                new Thread(() -> {
+                    try {
+                        define_nova_rota(p);
+                    } catch (IOException e) {
+                        System.out.println(e.getMessage());
+                    }
+
+                }).start();
+                break;
+
+            case 2: // Mensagem de ativacao da rota
+                break;
+
+            case 3: // Pedido de envio de multimedia
+                new Thread(() -> {
+                    try {
+                        trataMensagensMultimedia(p);
+                    } catch (Exception e) {
+                        System.out.println(e.getMessage());
+                    }
+
+                }).start();
+
+                break;
+
+            case 4: // ativacao vizinhos
+                new Thread(() -> {
+                    try {
+                        ativa_interface_vizinho(p.origem);
+                        System.out.println("Novo vizinho conectado: " + p.origem);
+                    } catch (IOException e) {
+                        System.out.println(e.getMessage());
+                    }
+
+                }).start();
+
+                break;
+
+            case 5: // Mensagem de ping
+                new Thread(() -> {
+                    try {
+                        enviaMsgPing(p);
+                    } catch (IOException | InterruptedException e) {
+                        System.out.println(e.getMessage());
+                    }
+
+                }).start();
+
+                break;
+
+            case -1: // Fim de conexao
+                new Thread(() -> {
+                    desativa_interfaces_vizinhos(p.origem);
+                    clientesATransmitir.remove(p.origem);
+                    clientesLigados.remove(p.origem);
+                }).start();
+
+                break;
+
+            default:
+                break;
+        }
+    }
+
+
+    // Envia os seus vizinhos ao nodo que se conectou
+    public void enviaVizinhos(Pacote p) throws IOException {
+        List<Interface> vizinhosList = overlay.get(p.origem);
+        final ByteArrayOutputStream byteOut = new ByteArrayOutputStream();
+        final DataOutputStream dataOut = new DataOutputStream(byteOut);
+        dataOut.writeInt(vizinhosList.size());
+
+        for (Interface i : vizinhosList) {
+            dataOut.writeUTF(i.idNodo);
+            dataOut.writeUTF(i.enderecoIP.getHostAddress());
+            dataOut.writeBoolean(i.estado);
+        }
+
+        dataOut.close();
+        byteOut.flush();
+        Pacote pSend = new Pacote(0, idNodo, p.origem, byteOut.toByteArray());
+        send(pSend, p.ipNodoAnterior);
+    }
+
+
+    public void ativa_interfaces_vizinhos(String idnode) {
+        for (List<Interface> li : overlay.values()) {
+            for (Interface i : li) {
+                if (i.idNodo.equals(idnode))
+                    i.estado = true;
             }
         }
     }
 
-    public void parseBootstrapper()  {
 
-        String pathBootstrapper = "/Users/ruimoreira/Desktop/ESR-TPs/TP2/src/boostrapper.txt";
 
-        BufferedReader bf = null;
+    public void trataMensagensMultimedia(Pacote p) throws Exception {
+        switch (p.fileInfo.tipoMensagem) {
+            case 0: // play
+                System.out.println("Começar a transmitir para "+ p.origem);
+                clientesATransmitir.add(p.origem);
+                break;
+            case 1: // pause
+                System.out.println("Parar de transmitir para "+ p.origem);
+                clientesATransmitir.remove(p.origem);
+                break;
+            default:
+                break;
+        }
+    }
+
+
+    public void enviaMsgPing(Pacote p) throws IOException, InterruptedException {
+        byte[] data = "Olá!".getBytes();
+        Pacote ping = new Pacote(5, idNodo, p.origem, data);
+        enviaTodosVizinhos(ping);
+    }
+
+
+    public void desativa_interfaces_vizinhos(String idnode) {
+        System.out.println("Nodo " + idnode + " terminou conexão. ");
+        for (List<Interface> li : overlay.values()) {
+            for (Interface i : li) {
+                if (i.idNodo.equals(idnode))
+                    i.estado = false;
+            }
+        }
+    }
+
+    // Resposta a mensagem de routing
+    // Ativar a rota com o menor tempo
+    public void define_nova_rota(Pacote p) throws IOException {
+        //long startTime = System.currentTimeMillis();
+        Pacote rt = new Pacote(2, idNodo, p.origem, 0);
+        enviaTodosVizinhos(rt);
+        System.out.println("Ativando rota para " + p.origem);
+    }
+
+    public void encerra_conexao()  {
+        Pacote p = new Pacote(-1, idNodo, "");
+        enviaTodosVizinhos(p);
+
+    }
+
+    public void send(Pacote p, InetAddress dest) throws IOException {
+        byte[] data = p.packetToBytes();
+        DatagramPacket dp = new DatagramPacket(data,data.length,dest, 9090);
+        sendLock.lock();
         try {
-            bf = new BufferedReader(new FileReader(pathBootstrapper));
-        } catch (FileNotFoundException e) {
-            throw new RuntimeException(e);
+            sendSocket.send(dp);
         }
-        List<String> linhas = bf.lines().toList();
-
-        bootstrapper = new HashMap<>();
-        nodosCruciais = new ArrayList<>();
-
-        for(String n : linhas) {
-            String [] param = n.split(":");
-            String ip_nodo = param[0];
-            String [] ips_vizinhos = param[1].split(",");
-
-            InetAddress inet_nodo;
-
-            if (ip_nodo.contains("!")) {
-                ip_nodo = ip_nodo.replace("!","");
-
-                try {
-                    inet_nodo = InetAddress.getByName(ip_nodo);
-                } catch (UnknownHostException e) {
-                    throw new RuntimeException(e);
-                }
-
-                nodosCruciais.add(inet_nodo);
-            } else {
-                try {
-                    inet_nodo = InetAddress.getByName(ip_nodo);
-                } catch (UnknownHostException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-
-            List<InetAddress> vizinhos = new ArrayList<>();
-
-            for(String s : ips_vizinhos) {
-                InetAddress viz = null;
-                try {
-                    viz = InetAddress.getByName(s);
-                } catch (UnknownHostException e) {
-                    throw new RuntimeException(e);
-                }
-                vizinhos.add(viz);
-            }
-            bootstrapper.put(inet_nodo,vizinhos);
+        finally {
+            sendLock.unlock();
         }
+    }
+
+    // envia pacote para todos os vizinhos
+    public void enviaTodosVizinhos(Pacote p) {
+        byte[] data;
         try {
-            bf.close();
-        } catch (IOException e) {
-            throw new RuntimeException(e);
+            data = p.packetToBytes();
+            for(Interface i : vizinhos.values()) {
+                if (i.estado) {
+                    DatagramPacket dp = new DatagramPacket(data,data.length,i.enderecoIP, 9090);
+                    sendLock.lock();
+                    try {
+                        sendSocket.send(dp);
+                    }
+                    finally {
+                        sendLock.unlock();
+                    }
+                }
+            }
+        } catch (IOException e1) {
+            e1.printStackTrace();
         }
     }
 
-
-    public void stream(InetAddress ip) throws Exception {
-      VideoFileName = "movie.Mjpeg";
-      System.out.println("Video File name " + VideoFileName);
-
-      File f = new File(VideoFileName);
-      if (f.exists()){
-          Servidor s = new Servidor(ip) ;
-      }else {
-          System.out.println("Ficheiro de video " + VideoFileName + " não existe.");
-      }
+    // Ativar interface de um vizinho
+    public void ativa_interface_vizinho(String idNode) throws IOException {
+        Interface i = vizinhos.get(idNode);
+        if (i != null)
+            i.estado = true;
     }
 
+    // Desativar interface de um vizinho
+    public void desativa_interface_vizinho(String idNode) throws IOException {
+        Interface i = vizinhos.get(idNode);
+        if(i != null)
+            i.estado = false;
+    }
 
-  //------------------------
-  //Handler for timer
-  //------------------------
-  public void actionPerformed(ActionEvent e) {
+    // Parse do ficheiro de configuracao
+    public void parseFicheiro(String filename) throws IOException {
 
-    //if the current image nb is less than the length of the video
-    if (imagenb < VIDEO_LENGTH)
-      {
-	//update current imagenb
-	imagenb++;
-       
-	try {
-	  //get next frame to send from the video, as well as its size
-	  int image_length = video.getnextframe(sBuf);
+        try (BufferedReader reader = new BufferedReader(new FileReader(filename))) {
 
-	  //Builds an RTPpacket object containing the frame
-	  RTPpacket rtp_packet = new RTPpacket(MJPEG_TYPE, imagenb, imagenb*FRAME_PERIOD, sBuf, image_length);
-	  
-	  //get to total length of the full rtp packet to send
-	  int packet_length = rtp_packet.getlength();
+            String line = reader.readLine();
 
-	  //retrieve the packet bitstream and store it in an array of bytes
-	  byte[] packet_bits = new byte[packet_length];
-	  rtp_packet.getpacket(packet_bits);
+            while (line != null) {
 
-	  //send the packet as a DatagramPacket over the UDP socket 
-	  senddp = new DatagramPacket(packet_bits, packet_length, ClientIPAddr, RTP_dest_port);
-	  RTPsocket.send(senddp);
+                String[] parte = line.split(" *: *");
+                String[] ips_vizinhos = parte[1].split(" *; *");
 
-	  System.out.println("Send frame #"+imagenb);
-	  //print the header bitstream
-	  rtp_packet.printheader();
+                List<Interface> interfaceList = new ArrayList<>();
 
-	  //update GUI
-	  //label.setText("Send frame #" + imagenb);
-	}
-	catch(Exception ex)
-	  {
-	    System.out.println("Exception caught: "+ex);
-	    System.exit(0);
-	  }
-      }
-    else
-      {
-	//if we have reached the end of the video file, stop the timer
-	sTimer.stop();
-      }
-  }
+                // percorre todos os vizinhos de um nodo
+                for (String s : ips_vizinhos) {
+                    String[] data = s.split(" *, *");
+                    InetAddress ipa = InetAddress.getByName(data[1]);
+                    Interface i;
+                    if (data[0].equals(idNodo))
+                        i = new Interface(data[0], ipa, true);
+                    else
+                        i = new Interface(data[0], ipa, false);
+                    interfaceList.add(i);
+                }
 
-}//end of Class Servidor
+                this.overlay.put(parte[0], interfaceList);
+
+                line = reader.readLine();
+            }
+        }
+
+        catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    //------------------------
+    //Handler for timer
+    //------------------------
+    @Override
+    public void actionPerformed(ActionEvent e) {
+        byte[] data;
+        try {
+            data = stream.actionPerformed();
+            if(!clientesATransmitir.isEmpty()) {
+                Pacote p = new Pacote(idNodo, stream.imagenb, clientesATransmitir, data);
+                enviaTodosVizinhos(p);
+            }
+        } catch (IOException e1) {
+            e1.printStackTrace();
+        }
+    }
+}

@@ -4,8 +4,10 @@
 
 
 
-### :handshake: Contributors:  
+## :handshake: Contributors:  
 - [Rodrigo Rodrigues](https://github.com/webst2r)  
 - [Rui Moreira](https://github.com/ruiFCMoreira)  
 - [Rui Monteiro](https://github.com/rushmetra)  
 
+
+## Final Grade: 15,4/20
